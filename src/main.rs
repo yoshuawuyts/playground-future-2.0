@@ -1,4 +1,7 @@
-use rustix::event::kqueue::{self, Event, EventFlags};
+use rustix::event::{
+    self,
+    kqueue::{self, Event, EventFilter, EventFlags},
+};
 use std::{
     io,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd},
@@ -8,6 +11,7 @@ use std::{
 #[cfg(target_os = "macos")]
 fn main() {
     println!("hello from macos");
+    let poller = Poller::new();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -16,6 +20,7 @@ fn main() {
 }
 
 pub enum Waitable {
+    // TODO: rename to "Fd"?
     Network(RawFd, Interest),
 }
 
@@ -52,56 +57,52 @@ where
 
 struct Poller {
     queue: OwnedFd,
+    events: Vec<kqueue::Event>,
 }
 
 impl Poller {
     pub(crate) fn new() -> io::Result<Self> {
         let queue = kqueue::kqueue()?;
-        Ok(Self { queue })
+        Ok(Self {
+            queue,
+            events: vec![],
+        })
     }
     /// Registers interest in events descripted by `Event` in the given file descriptor referrred to
     /// by `file`.
-    pub(crate) fn register(&self, event: Waitable) -> io::Result<()> {
+    pub(crate) fn register(&mut self, event: Waitable) -> io::Result<()> {
         match event {
             Waitable::Network(fd, interest) => {
-                let (read_flags, write_flags) = match interest {
-                    Interest::Read => (EventFlags::ADD, EventFlags::DELETE),
-                    Interest::Write => (EventFlags::DELETE, EventFlags::ADD),
-                    Interest::ReadWrite => (EventFlags::ADD, EventFlags::ADD),
-                };
-                // Because all of our events are ONESHOT we don't need to provide a de-registration API.
-                let common_file_flags = EventFlags::RECEIPT | EventFlags::ONESHOT;
-
-                // TODO: this is pretty goofy: if we don't have a specific kind
-                // of interest, we shouldn't create an event.
-                let changelist = [
-                    kqueue::Event::new(
-                        kqueue::EventFilter::Read(fd),
-                        common_file_flags | read_flags,
-                        0,
-                    ),
-                    kqueue::Event::new(
-                        kqueue::EventFilter::Write(fd),
-                        common_file_flags | write_flags,
-                        0,
-                    ),
-                ];
-
-                // Create our buffer on the stack that kqueue will use to write responses into for each
-                // event that we pass in our changelist
-                unsafe {
-                    register_events(&self.queue, &changelist, None)?;
+                let flags = EventFlags::ADD | EventFlags::RECEIPT | EventFlags::ONESHOT;
+                match interest {
+                    Interest::Read => {
+                        let event = kqueue::Event::new(EventFilter::Read(fd), flags, 0);
+                        self.events.push(event);
+                    }
+                    Interest::Write => {
+                        let event = kqueue::Event::new(EventFilter::Write(fd), flags, 0);
+                        self.events.push(event);
+                    }
+                    Interest::ReadWrite => {
+                        let event = kqueue::Event::new(EventFilter::Read(fd), flags, 0);
+                        self.events.push(event);
+                        let event = kqueue::Event::new(EventFilter::Write(fd), flags, 0);
+                        self.events.push(event);
+                    }
                 };
 
                 Ok(())
             }
-            _ => panic!("unknown even type"),
         }
     }
 
-    pub(crate) fn wait(&self, events: &mut Events) -> io::Result<()> {
-        unsafe { kqueue::kevent(&self.queue, &[], &mut events.eventlist, None)? };
+    pub(crate) fn wait(&self) -> io::Result<Vec<kqueue::Event>> {
+        // TODO: we don't need to allocate here actually - see:
+        // https://github.com/michaelhelvey/lilfuture/blob/f3bf0c5ff83cc462cb4659471275a95ecd439c39/src/poll.rs#L24
+        let mut event_list = vec![];
+        let timer = None;
+        unsafe { kqueue::kevent(&self.queue, &self.events, &mut event_list, timer)? };
 
-        Ok(())
+        Ok(event_list)
     }
 }
