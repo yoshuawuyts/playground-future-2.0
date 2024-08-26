@@ -1,12 +1,12 @@
 [package]
-name = "playground-future-2.0"
+name = "playground-future-2-0"
 version = "1.0.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yoshuawuyts/playground-future-2.0"
+repository = "https://github.com/yoshuawuyts/playground-future-2-0"
 documentation = "https://docs.rs/playground-future-2.0"
 description = "Experimenting with a different formulation of Future"
 readme = "README.md"
-edition = "2018"
+edition = "2021"
 keywords = []
 categories = []
 authors = [
@@ -16,5 +16,7 @@ authors = [
 [features]
 
 [dependencies]
+libc = "0.2.158"
+rustix = { version = "0.38.34", features = ["event"] }
 
 [dev-dependencies]

@@ -61,6 +61,10 @@ look at some of these issues:
 [good-first-issue]: https://github.com/yoshuawuyts/playground-future-2.0/labels/good%20first%20issue
 [help-wanted]: https://github.com/yoshuawuyts/playground-future-2.0/labels/help%20wanted
 
+## References
+
+- [Writing an async runtime in Rust](https://michaelhelvey.dev/posts/rust_async_runtime)
+
 ## License
 
 <sup>
