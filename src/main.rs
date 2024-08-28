@@ -5,8 +5,8 @@
 
 use rustix::event::kqueue;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::thread;
 use std::time::Duration;
 
@@ -32,53 +32,119 @@ impl Poller {
     // You could delete the event as well, and failing to do so isn't actually catastrophic - the
     // worst case is more spurious wakes.
     pub fn register_read(&mut self, fd: RawFd) -> io::Result<usize> {
-        // add a notification for read-readiness
-        let notif = kqueue::EventFilter::Read(fd);
-        // add a level-triggered event
-        //
-        // add EV_CLEAR too to make it edge-triggered, which is generally what you want in
-        // practice, but that is a discussion for another time
         let flags = kqueue::EventFlags::ADD;
-        // 7 seems like a nice number to assert we get back!
         let udata = 7;
-        let event = kqueue::Event::new(notif, flags, udata);
-
-        // pass in no timeout, and wait indefinitely for events
+        let event = kqueue::Event::new(kqueue::EventFilter::Read(fd), flags, udata);
         let timeout = None;
-        let event_count =
-            unsafe { kqueue::kevent(&self.queue, &[event], &mut self.events, timeout)? };
-        Ok(event_count)
+        Ok(unsafe { kqueue::kevent(&self.queue, &[event], &mut self.events, timeout)? })
     }
 
+    // Wait for some event to complete
     fn wait(&mut self) -> io::Result<usize> {
         // safety: we are not modifying the list, just polling
-        let event_count =
-            unsafe { kqueue::kevent(self.queue.as_fd(), &[], &mut self.events, None)? };
-        Ok(event_count)
+        Ok(unsafe { kqueue::kevent(self.queue.as_fd(), &[], &mut self.events, None)? })
     }
 
+    // Unregister the client for interest in read events.
     pub fn unregister_read(&mut self, fd: RawFd) -> io::Result<usize> {
-        let change_list = &[kqueue::Event::new(
-            kqueue::EventFilter::Read(fd),
-            // remove the event
-            kqueue::EventFlags::DELETE,
-            7,
-        )];
+        let flags = kqueue::EventFlags::DELETE;
+        let udata = 7;
+        let event = kqueue::Event::new(kqueue::EventFilter::Read(fd), flags, udata);
 
-        // we are not waiting on events this time, no need to pass in a real buffer
-        let mut event_list = Vec::new();
-
-        // dont block
+        let mut event_list = vec![];
         let timeout = Some(Duration::ZERO);
-        let event_count =
-            unsafe { kqueue::kevent(&self.queue, change_list, &mut event_list, timeout)? };
-        Ok(event_count)
+        Ok(unsafe { kqueue::kevent(&self.queue, &[event], &mut event_list, timeout)? })
+    }
+
+    fn events(&self) -> Vec<Waitable> {
+        self.events
+            .iter()
+            .map(|event| match event.filter() {
+                kqueue::EventFilter::Read(fd) => Waitable::Fd(fd, Interest::Read),
+                _ => panic!("non-read filter found!"),
+            })
+            .collect()
     }
 }
 
-impl AsFd for Poller {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.queue.as_fd()
+#[derive(Debug)]
+enum Interest {
+    Read,
+}
+
+#[derive(Debug)]
+pub enum Waitable {
+    /// Registered file descriptor.
+    Fd(RawFd, Interest),
+}
+
+pub trait Future {
+    type Output;
+    fn poll(&mut self, ready: &[Waitable]) -> impl Iterator<Item = Waitable>;
+    fn take(&mut self) -> Option<Self::Output>;
+}
+
+/// A conversion into an asynchronous computation.
+pub trait IntoFuture {
+    type Output;
+    type IntoFuture: Future<Output = Self::Output>;
+    fn into_future(self) -> Self::IntoFuture;
+}
+
+impl<T> IntoFuture for T
+where
+    T: Future,
+{
+    type Output = T::Output;
+    type IntoFuture = T;
+    fn into_future(self) -> Self::IntoFuture {
+        self
+    }
+}
+
+struct AsyncTcpStream(TcpStream);
+impl AsRawFd for AsyncTcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+impl AsyncTcpStream {
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let client = TcpStream::connect(addr)?;
+        client.set_nonblocking(true)?;
+        Ok(Self(client))
+    }
+
+    pub fn read<'a>(&mut self, data: &'a mut [u8]) -> ReadFuture<'_, 'a> {
+        ReadFuture { stream: self, data }
+    }
+}
+
+struct ReadFuture<'a, 'b> {
+    stream: &'a mut AsyncTcpStream,
+    data: &'b mut [u8],
+}
+
+fn block_on<Fut: IntoFuture>(future: Fut) -> io::Result<Fut::Output> {
+    let mut fut = future.into_future();
+    let mut poller = Poller::open().unwrap();
+    loop {
+        let mut should_wait = false;
+        for waitable in fut.poll(&poller.events()) {
+            should_wait = true;
+            match waitable {
+                Waitable::Fd(fd, Interest::Read) => poller.register_read(fd)?,
+            };
+        }
+
+        if should_wait {
+            poller.wait()?;
+        } else {
+            match fut.take() {
+                Some(output) => return Ok(output),
+                None => panic!("Item was already taken somehow?"),
+            }
+        }
     }
 }
 
@@ -90,37 +156,45 @@ fn main() -> io::Result<()> {
     let mut poller = Poller::open()?;
 
     // set up the client
-    let mut client = TcpStream::connect("127.0.0.1:8080")?;
-    client.set_nonblocking(true)?;
+    let mut client = AsyncTcpStream::connect("127.0.0.1:8080")?;
 
     // we have not written anything yet, this should get EWOULDBLOCK
     assert_eq!(
         std::io::ErrorKind::WouldBlock,
-        client.read(&mut [0; 32]).unwrap_err().kind()
+        client.0.read(&mut [0; 32]).unwrap_err().kind()
     );
 
     // send some data over the wire, and wait 1 second for the server to hopefully echo it back
-    client.write(b"hello, world!").unwrap();
+    client.0.write(b"hello, world!").unwrap();
     thread::sleep(Duration::from_secs(1));
 
-    let mut event_count = poller.register_read(client.as_raw_fd())?;
+    let mut n = 0;
 
     // we loop due to spurious events being a possibility, polling may need to be retried
+    let mut is_registered = false;
     loop {
-        if event_count == 1 {
+        if n == 1 || !is_registered {
             // verify that the event has the user data we specified, this is just to show udata in
             // action
-            assert_eq!(7, poller.events[0].udata());
+            if is_registered {
+                assert_eq!(7, poller.events[0].udata());
+            }
 
             let mut buffer = [0; 32];
 
-            match client.read(&mut buffer) {
+            match client.0.read(&mut buffer) {
                 Ok(n) => {
                     assert_eq!(b"hello, world!", &buffer[..n]);
+                    println!("data validated!");
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    event_count = poller.wait()?
+                    // register read interest after the first blocking read call
+                    if !is_registered {
+                        poller.register_read(client.as_raw_fd())?;
+                        is_registered = true;
+                    }
+                    n = poller.wait()?;
                 }
                 Err(e) => {
                     panic!("Unexpected error {e:?}");
@@ -142,7 +216,6 @@ fn run_echo_server() {
 
     loop {
         let conn = listener.accept().unwrap();
-
         thread::spawn(move || handle_new_echo_server_connection(conn.0));
     }
 }
