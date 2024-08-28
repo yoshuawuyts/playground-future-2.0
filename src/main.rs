@@ -1,17 +1,35 @@
-use rustix::event::{
-    self,
-    kqueue::{self, Event, EventFilter, EventFlags},
+use rustix::{
+    event::kqueue::{self, Event, EventFilter, EventFlags},
+    io::Errno,
 };
 use std::{
     io,
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd},
-    time::Duration,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
+use std::net::TcpListener;
+
 #[cfg(target_os = "macos")]
-fn main() {
-    println!("hello from macos");
-    let poller = Poller::new();
+fn main() -> io::Result<()> {
+    let mut poller = Poller::new().unwrap();
+
+    // Create a new blocking Tcp listener on a un-allocated port:
+    let addr = "127.0.0.1:3456";
+    let listener = AsyncTcpListener::bind(addr)?;
+
+    poller.register(Waitable::Fd(listener.as_raw_fd(), Interest::ReadWrite))?;
+
+    // connect to the listener from another thread to trigger an event:
+    // std::thread::scope(|s| {
+    //     s.spawn(|| {
+    //         let _ = TcpStream::connect(addr).unwrap();
+    //     });
+    // });
+
+    // check for events!
+    let events = poller.wait()?;
+    assert_eq!(events.len(), 1);
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -19,12 +37,39 @@ fn main() {
     compile_error!("no impls for non-macos targets quite yet");
 }
 
-pub enum Waitable {
-    // TODO: rename to "Fd"?
-    Network(RawFd, Interest),
+struct AsyncTcpListener {
+    listener: TcpListener,
 }
 
-enum Interest {
+impl AsyncTcpListener {
+    pub fn bind(addr: &str) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self { listener })
+    }
+}
+
+impl AsRawFd for AsyncTcpListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+
+#[derive(Debug)]
+pub enum Waitable {
+    /// Registered file descriptor.
+    Fd(RawFd, Interest),
+    // See: https://github.com/smol-rs/polling/blob/1ee697a750f0b3a3b009294130eed13aa7bc994d/src/kqueue.rs
+    // /// Signal.
+    // Signal(std::os::raw::c_int, Interest),
+    // /// Process ID.
+    // Pid(rustix::process::Pid, Interest),
+    // /// Timer.
+    // Timer(usize, Interest),
+}
+
+#[derive(Debug)]
+pub enum Interest {
     Read,
     Write,
     ReadWrite,
@@ -57,7 +102,7 @@ where
 
 struct Poller {
     queue: OwnedFd,
-    events: Vec<kqueue::Event>,
+    event_list: Vec<kqueue::Event>,
 }
 
 impl Poller {
@@ -65,44 +110,87 @@ impl Poller {
         let queue = kqueue::kqueue()?;
         Ok(Self {
             queue,
-            events: vec![],
+            event_list: vec![],
         })
     }
     /// Registers interest in events descripted by `Event` in the given file descriptor referrred to
     /// by `file`.
     pub(crate) fn register(&mut self, event: Waitable) -> io::Result<()> {
-        match event {
-            Waitable::Network(fd, interest) => {
-                let flags = EventFlags::ADD | EventFlags::RECEIPT | EventFlags::ONESHOT;
+        match dbg!(event) {
+            Waitable::Fd(fd, interest) => {
+                let flags = EventFlags::ADD | EventFlags::RECEIPT | EventFlags::CLEAR;
                 match interest {
                     Interest::Read => {
-                        let event = kqueue::Event::new(EventFilter::Read(fd), flags, 0);
-                        self.events.push(event);
+                        dbg!("read");
+                        let event = kqueue::Event::new(EventFilter::Read(fd), flags, 1234);
+                        unsafe {
+                            kqueue::kevent(&self.queue, &[event], &mut self.event_list, None)?
+                        };
                     }
                     Interest::Write => {
-                        let event = kqueue::Event::new(EventFilter::Write(fd), flags, 0);
-                        self.events.push(event);
+                        dbg!("write");
+                        let event = kqueue::Event::new(EventFilter::Write(fd), flags, 1);
+                        unsafe {
+                            kqueue::kevent(&self.queue, &[event], &mut self.event_list, None)?
+                        };
                     }
                     Interest::ReadWrite => {
-                        let event = kqueue::Event::new(EventFilter::Read(fd), flags, 0);
-                        self.events.push(event);
-                        let event = kqueue::Event::new(EventFilter::Write(fd), flags, 0);
-                        self.events.push(event);
+                        dbg!("read-write");
+                        let events = [
+                            kqueue::Event::new(EventFilter::Read(fd), flags, 0),
+                            kqueue::Event::new(EventFilter::Write(fd), flags, 0),
+                        ];
+                        unsafe {
+                            kqueue::kevent(&self.queue, &events, &mut self.event_list, None)?
+                        };
                     }
                 };
+
+                // Check for errors
+                let timer = None;
+                unsafe { kqueue::kevent(&self.queue, &[], &mut self.event_list, timer)? };
+                for event in self.event_list.iter() {
+                    check_event_error(event)?;
+                }
+                self.event_list.clear();
 
                 Ok(())
             }
         }
     }
 
-    pub(crate) fn wait(&self) -> io::Result<Vec<kqueue::Event>> {
-        // TODO: we don't need to allocate here actually - see:
-        // https://github.com/michaelhelvey/lilfuture/blob/f3bf0c5ff83cc462cb4659471275a95ecd439c39/src/poll.rs#L24
-        let mut event_list = vec![];
-        let timer = None;
-        unsafe { kqueue::kevent(&self.queue, &self.events, &mut event_list, timer)? };
+    pub(crate) fn wait(&mut self) -> io::Result<&[kqueue::Event]> {
+        assert_eq!(self.event_list.len(), 0, "doesn't hold any output");
 
-        Ok(event_list)
+        // wait for all events
+        let timer = None;
+        unsafe { kqueue::kevent(&self.queue, &[], &mut self.event_list, timer)? };
+
+        // Handle any possible errors
+        for event in &self.event_list {
+            check_event_error(event)?;
+        }
+
+        Ok(&self.event_list)
+    }
+}
+
+/// Check the returned kevent error.
+fn check_event_error(event: &Event) -> io::Result<()> {
+    let data = event.data();
+    if event.flags().contains(kqueue::EventFlags::ERROR)
+            && data != 0
+            && data != Errno::NOENT.raw_os_error() as _
+            // macOS can sometimes throw EPIPE when registering a file descriptor for a pipe
+            // when the other end is already closed, but kevent will still report events on
+            // it so there's no point in propagating it...it's valid to register interest in
+            // the file descriptor even if the other end of the pipe that it's connected to
+            // is closed
+            // See: https://github.com/tokio-rs/mio/issues/582
+            && data != Errno::PIPE.raw_os_error() as _
+    {
+        return Err(io::Error::from_raw_os_error(data as _));
+    } else {
+        Ok(())
     }
 }
